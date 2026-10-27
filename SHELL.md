@@ -22,7 +22,8 @@ zsh 5.8 on Ubuntu 20.04 (WSL2); PowerShell 5.1 on Windows.
 | nushell, elvish | no                           | FIFO bridge or a helper                                                 | not tested      |
 
 **Only zsh** among the traditional shells can connect to a Unix socket on its own. That is the
-whole reason `socutil-cli` exists, and the reason the FIFO bridge below is worth knowing.
+whole reason `socutil-cli` exists, and the reason the FIFO bridge below is worth knowing. (bash can
+be given the same power by loading a builtin into it — see § 4.)
 
 Two traps in the table, both verified:
 
@@ -180,16 +181,56 @@ Keep one coprocess alive for a whole script and the cost is one fork per session
 
 ### 4. A loadable builtin — the only truly native option for bash
 
-bash can load a compiled builtin into the running shell:
+bash can load a compiled builtin into the running shell, which is zsh's capability built by hand:
 
 ```bash
-enable -f ./sock.so sock        # once
-sock -a fd /path/to/socket      # native from then on
+enable -f ./probe.so probe      # once
+enable probe                    # load_builtin registers it DISABLED
+probe                           # native from here on: nothing forks
 ```
 
-That is zsh's capability, built by hand: after `enable -f`, the connection is a shell builtin and
-nothing forks. It costs a small C file against bash's builtin API (the `enable -f` route needs the
-bash development headers), so it is worth it only where a hot path matters. Not measured here.
+**Measured, and built with Zig** — no C and no bash headers. The whole object is a struct and one
+function, and bash's own dynamic symbol table supplies the API (`bind_variable` and friends are
+undefined in the object and resolve when bash dlopens it; the Ubuntu bash exports ~2200 symbols):
+
+```zig
+const Builtin = extern struct {
+    name: ?[*:0]const u8,
+    function: ?BuiltinFn,
+    flags: c_int,
+    long_doc: ?*const ?[*:0]const u8,
+    short_doc: ?[*:0]const u8,
+    handle: ?*anyopaque,
+};
+
+extern fn bind_variable(name: [*:0]const u8, value: ?[*:0]u8, flags: c_int) c_int;
+
+// `var`, not `const`: bash writes its dlopen handle into this struct.
+export var probe_struct: Builtin = .{ ... };
+```
+
+It cross-compiles from Windows to the Linux target, and comes out tiny:
+
+```sh
+zig build-lib -dynamic -fPIC -O ReleaseSafe -fstrip -fallow-shlib-undefined \
+    -target x86_64-linux-gnu.2.31 -lc --name probe probe.zig     # 3144 bytes
+```
+
+Three details decide whether it works, and each one is a silent failure otherwise:
+
+- **The struct must be writable.** `enable -f` stores the `dlopen` handle into the struct it found,
+  so a `const` places it in `.data.rel.ro`, which a full-RELRO link makes read-only after
+  relocation — the write faults and bash segfaults inside `enable -f`. This is why an optimized
+  build crashed while the Debug build worked: `var` moves it to `.data`.
+- **`enable -f` leaves the builtin disabled.** `enable -n <name>` is what it reports afterwards, so
+  a separate `enable <name>` must run **in the same shell**; put it in a pipeline and the enable
+  happens in a subshell and is lost.
+- **The lookup symbol is `<name>_struct`.** `enable -f file name` dlopens the file and looks for
+  that exact symbol; the `struct builtin` name field should match, but the symbol is what is found.
+
+Every field after `function` is left zero on purpose: `flags` and `long_doc` have changed order
+between bash versions, and with both zero the ordering cannot be observed. So the same object loads
+on any bash that exports its symbols.
 
 ### 5. An in-process host
 
@@ -201,14 +242,14 @@ only fork-free option, since no Windows shell has a socket builtin. Windows Powe
 
 ## Summary
 
-| Shell        | Native?          | Cheapest no-fork route                  | Fully fork-free?        |
-| ------------ | ---------------- | --------------------------------------- | ----------------------- |
-| zsh          | yes              | `zsocket`                               | yes, for text protocols |
-| bash         | no               | FIFO bridge, or `/dev/tcp` + TCP bridge | yes, per call           |
-| dash         | no               | FIFO bridge                             | yes, per call           |
-| ksh93        | no               | FIFO bridge, or `/dev/tcp` + TCP bridge | yes, per call           |
-| fish         | no               | FIFO bridge                             | yes, per call           |
-| PowerShell 7 | yes (in-process) | .NET socket                             | yes                     |
+| Shell        | Native?                        | Cheapest no-fork route                               | Fully fork-free?        |
+| ------------ | ------------------------------ | ---------------------------------------------------- | ----------------------- |
+| zsh          | yes                            | `zsocket`                                            | yes, for text protocols |
+| bash         | no, unless a builtin is loaded | FIFO bridge, `/dev/tcp` + TCP bridge, or `enable -f` | yes, per call           |
+| dash         | no                             | FIFO bridge                                          | yes, per call           |
+| ksh93        | no                             | FIFO bridge, or `/dev/tcp` + TCP bridge              | yes, per call           |
+| fish         | no                             | FIFO bridge                                          | yes, per call           |
+| PowerShell 7 | yes (in-process)               | .NET socket                                          | yes                     |
 
 The single-sentence version: **zsh can do it natively; every other shell can do it only if some
 long-lived process already owns the connection** — a FIFO bridge (universal), a TCP bridge
