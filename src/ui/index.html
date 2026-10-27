@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>socutil - unix sockets</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>socutil</h1>
+  <span id="status" class="status">idle</span>
+</header>
+<main class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <h2>unix sockets</h2>
+      <button id="refresh" type="button" class="icon-button" title="Rescan directories">&#x21bb;</button>
+    </div>
+    <ul id="sockets" class="socket-list"></ul>
+    <p id="empty" class="empty" hidden>No sockets found.</p>
+  </aside>
+  <section class="terminal">
+    <div class="terminal-head">
+      <span id="target" class="target">not connected</span>
+      <button id="disconnect" type="button" class="button" disabled>Disconnect</button>
+    </div>
+    <pre id="output" class="output" aria-live="polite"></pre>
+    <form id="input-form" class="input-row" autocomplete="off">
+      <span class="prompt">&gt;</span>
+      <input id="input" type="text" placeholder="type a command and press Enter" disabled>
+      <button id="send" type="submit" class="button" disabled>Send</button>
+    </form>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

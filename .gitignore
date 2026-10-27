@@ -1,0 +1,6 @@
+# Zig build output and caches
+zig-out/
+.zig-cache/
+
+# Scratch: test fixtures and browser profiles (see README "Tests")
+.tmp/
