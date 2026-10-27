@@ -1,70 +1,65 @@
 # Calling Unix Sockets from the Shell
 
-This document explains how to call compatible Unix-domain sockets from the shell, and how to
-optimise that call to avoid forking a new process where the shell allows it.
+How to call a compatible Unix-domain socket as if it were a shell command, and how to do it
+without forking a helper process per call. "Without forking" means the shell itself holds the
+connection — no `socat`, no `socutil-cli`, no child per message.
 
-## The two binaries
+Everything marked **measured** below was run against a real `AF_UNIX` server, not inferred from
+documentation. The shells tested were bash 5.0.17, dash 0.5.10, ksh93 2020.0.0, fish 4.1.1 and
+zsh 5.8 on Ubuntu 20.04 (WSL2); PowerShell 5.1 on Windows.
 
-socutil ships two binaries:
+## What each shell can do
 
-| Binary        | Role                                                                                    |
-| ------------- | --------------------------------------------------------------------------------------- |
-| `socutil`     | HTTP server: a browser UI that proxies one or more Unix sockets over WebSocket and SSE. |
-| `socutil-cli` | A `socat` alternative: connects to a Unix socket and relays stdin/stdout.               |
+| Shell           | Opens a Unix socket itself?  | No-fork route                                                           | Measured        |
+| --------------- | ---------------------------- | ----------------------------------------------------------------------- | --------------- |
+| **zsh**         | **yes** — `zsocket` builtin  | `zmodload zsh/net/socket`; `zsocket <path>`; read/write on the fd       | yes             |
+| bash            | no                           | `/dev/tcp` only for TCP; for Unix either a bridge or a loadable builtin | yes             |
+| dash / POSIX sh | no                           | FIFO bridge (see below)                                                 | yes             |
+| ksh93           | no                           | `/dev/tcp` for TCP only; FIFO bridge for Unix                           | yes             |
+| fish 4          | no                           | FIFO bridge                                                             | yes             |
+| PowerShell 5.1  | no                           | .NET Framework has no Unix socket endpoint                              | yes             |
+| PowerShell 7+   | yes, in-process (.NET)       | `System.Net.Sockets.UnixDomainSocketEndPoint`                           | not tested here |
+| nushell, elvish | no                           | FIFO bridge or a helper                                                 | not tested      |
 
-`socutil-cli` is the forking path. It is a drop-in replacement for `socat - UNIX-CONNECT:/path`:
+**Only zsh** among the traditional shells can connect to a Unix socket on its own. That is the
+whole reason `socutil-cli` exists, and the reason the FIFO bridge below is worth knowing.
+
+Two traps in the table, both verified:
+
+- **bash's `/dev/tcp` is not Unix support.** It carries TCP (`exec 3<>/dev/tcp/host/port` round-trips),
+  but `/dev/unix/...` does not exist, and opening a socket *node* as a file fails with
+  `ENXIO` (`No such device or address`) — a socket is not a file you can open.
+- **ksh93 has `/dev/tcp` too**, and no Unix equivalent. A shell having network builtins says
+  nothing about Unix sockets.
+
+## The forking path: `socutil-cli`
+
+For a one-off call, fork — it is the most portable thing there is:
 
 ```sh
-socutil-cli /path/to/socket
-```
-
-Everything you type on stdin is written to the socket; everything the socket writes is printed
-on stdout. When either side closes, the process exits.
-
-## When forking is fine
-
-For one-off calls, forking is the simplest and most portable approach:
-
-```sh
-# Send a single line and read the response
 printf 'hello\n' | socutil-cli /path/to/socket
 ```
 
-This forks one `socutil-cli` process per call. For interactive use or scripting where each call
-is a separate invocation, that is acceptable.
+`socutil-cli` is a drop-in replacement for `socat - UNIX-CONNECT:/path`: stdin goes to the socket,
+the socket's output goes to stdout, and it exits when either side closes.
 
-## Skipping the fork: shell functions
+## zsh: the socket is a file descriptor
 
-Some shells can talk to a Unix socket **without forking a child process**. Where that is viable,
-define a shell function that opens the socket directly and relays bytes through file descriptors.
-The function replaces the `socutil-cli` fork with in-shell I/O.
-
-### zsh — no fork
-
-zsh has a built-in socket module (`zsh/net/socket`) that can open a Unix-domain socket directly from
-the shell, with no child process. The module name matters: it is `zsh/net/socket`, not `zsh/socket`.
+zsh ships a socket module. The name matters: it is `zsh/net/socket`, **not** `zsh/socket`.
 
 ```zsh
-# Load the socket module (once per shell session)
 zmodload zsh/net/socket
 
-# Open an outbound Unix-domain connection. The filename is a positional argument and the
-# resulting file descriptor is stored in REPLY.
+# Outbound connection. The path is positional; the descriptor lands in REPLY.
 zsocket /path/to/socket
 fd=$REPLY
 
-# Write to the socket
-printf 'hello\n' >&$fd
-
-# Read from the socket
-read -u $fd response
+printf 'hello\n' >&$fd      # printf is a builtin
+read -u $fd response        # read is a builtin
 print -r -- $response
 
-# Close
 exec {fd}>&-
 ```
-
-The `zsocket` sub-forms are easy to confuse, so they are worth stating:
 
 | form                               | what it does                                           |
 | ---------------------------------- | ------------------------------------------------------ |
@@ -72,10 +67,10 @@ The `zsocket` sub-forms are easy to confuse, so they are worth stating:
 | `zsocket -l [-v] [-d fd] filename` | **listen** on `filename`; listener fd in `REPLY`       |
 | `zsocket -a [-tv] [-d target] lid` | **accept** one inbound connection on listener `lid`    |
 
-There is no `-u` option — Unix-domain is the only thing this builtin speaks — and `-a` is *accept*,
-not "allocate". Getting that wrong is the usual way this example is copied incorrectly.
+There is no `-u` option (Unix-domain is all this builtin speaks) and `-a` is *accept*, not
+"allocate" — misreading those is the usual way this example gets copied wrongly.
 
-Wrap it in a function so the socket is opened and closed per call:
+As a function, so the socket is opened and closed per call:
 
 ```zsh
 fsmeta() {
@@ -90,23 +85,77 @@ fsmeta() {
     done
     exec {fd}>&-
 }
-
-# Usage:
-fsmeta /path/to/socket
 ```
 
-This does **not** fork. The shell itself owns the socket file descriptor.
+**Measured**: the function above round-trips against a request/response socket, the shell's PID is
+identical before and after, and the child count does not change. Binary is fine too, as long as it
+stays out of variables — `printf '\000\001\377AB' >&$fd` then `cat <&$fd` echoed `00 01 ff 41 42`
+exactly.
 
-### bash — coproc (still forks, but contained)
+Note the boundary precisely: `zsocket`, `printf` and `read` are builtins, so a **text** protocol
+forks nothing. Arbitrary **binary** needs redirection, and the usual `cat` is an external process —
+the connection still needs no helper, but the byte copy may. And no shell variable can hold a NUL,
+so binary must never pass through one.
 
-bash has no built-in Unix-socket support. The closest is `coproc` (bash 4+), which runs a
-command in a coprocess and exposes its stdin/stdout as file descriptors. This still forks, but
-the fork is contained within the function and the coprocess is cleaned up when the function
-returns.
+## Bringing no-fork to the other shells
 
-The direction of the two descriptors is the easy mistake: with `coproc NAME`, `NAME[0]` is the
-pipe the shell **reads** from (the coprocess's stdout), and `NAME[1]` is the pipe the shell
-**writes** to (the coprocess's stdin).
+### 1. The FIFO bridge — works in every shell
+
+A long-lived daemon owns the connection and publishes two named pipes. The shell then uses plain
+redirection on a path, where `printf` and `read` are builtins in every shell:
+
+```sh
+printf 'request\n' > /run/socutil/req      # builtin printf + redirection: no process
+IFS= read -r reply < /run/socutil/resp     # builtin read + redirection: no process
+```
+
+The fork happens once, when the bridge starts — the same shape as a server. FIFO open blocking
+provides the rendezvous for free, and one request/one response is exactly the shape a
+request/response socket already has.
+
+**Measured** in bash, dash and fish against one socket, one daemon:
+
+```
+== bash ==   reply: echo:from-bash     printf: builtin, read: builtin
+== dash ==   reply: echo:from-dash
+== fish ==   reply: echo:from-fish
+== bash: children before=1 after=1
+```
+
+Trade-offs, stated plainly:
+
+- **Serialised.** One request is in flight at a time; this suits request/response, not a
+  multiplexed stream.
+- **Not streaming.** A protocol that keeps a connection open and pushes events (the fs-meta
+  `serve` replay) does not fit the one-shot shape; the bridge would have to define how a session
+  ends.
+- **A daemon must exist.** Something has to own the connection — that is irreducible: a shell
+  without a socket syscall cannot create one.
+- **Permissions matter.** The FIFOs are a capability: create them in a private directory with
+  mode `0600`, or another local user can borrow your connection.
+
+This is the natural extension for `socutil`: a bridge mode that takes `--dir` like the server and
+serves `req`/`resp`, so any shell gets fork-free access without a new binary per call.
+
+### 2. TCP bridge + `/dev/tcp` — bash and ksh93
+
+bash and ksh93 can open a TCP connection with no process, so anything exposed over TCP is
+reachable fork-free. Both hops were measured:
+
+```
+bash, direct:   exec 3<>/dev/tcp/127.0.0.1/19555 ; printf 'hello\n' >&3 ; read -u 3 line
+                -> got: tcp-echo:hello
+bash, via a TCP<->Unix bridge:  -> got: unix-echo:hello
+```
+
+One long-lived bridge process, started once, plus `exec 3<>/dev/tcp/...` per call. This is the
+same niche the HTTP endpoint fills, minus HTTP: a raw byte tunnel. `dash` and `fish` have no
+`/dev/tcp`, so this route is closed to them.
+
+### 3. `coproc` — one fork per session, scoped
+
+bash's `coproc` runs a relay and hands you its pipes. It still forks, but once per coprocess rather
+than once per message, and the descriptors are ordinary fds afterwards:
 
 ```bash
 fsmeta() {
@@ -120,53 +169,64 @@ fsmeta() {
     exec {rfd}<&-
     wait $pid 2>/dev/null
 }
-
-# Usage:
-fsmeta /path/to/socket
 ```
 
-This forks one `socutil-cli` process per call, but the fork is scoped to the function and the
-process is reaped before the function returns.
+The descriptor **directions** are the easy mistake: with `coproc SC`, `SC[0]` is the pipe the shell
+**reads** (the coprocess's stdout) and `SC[1]` is the pipe the shell **writes** (its stdin).
+Writing to `SC[0]` fails — measured.
 
-One caveat is inherent to a one-shot relay: `socutil-cli` exits when **either** side closes, so
-closing the write end after `cat` can end the process before a slow reply is read. If the peer
-answers only after it has consumed all input, keep the write end open (drop the `exec {wfd}>&-`)
-and read until the socket closes instead.
+Keep one coprocess alive for a whole script and the cost is one fork per session, not per call.
+`fish` has no `coproc`; `dash` has no arrays, so this recipe is bash-only.
 
-### fish — no built-in
+### 4. A loadable builtin — the only truly native option for bash
 
-fish has no built-in Unix-socket support and no coproc equivalent. The forking path
-(`socutil-cli`) is the only option:
+bash can load a compiled builtin into the running shell:
 
-```fish
-printf 'hello\n' | socutil-cli /path/to/socket
+```bash
+enable -f ./sock.so sock        # once
+sock -a fd /path/to/socket      # native from then on
 ```
+
+That is zsh's capability, built by hand: after `enable -f`, the connection is a shell builtin and
+nothing forks. It costs a small C file against bash's builtin API (the `enable -f` route needs the
+bash development headers), so it is worth it only where a hot path matters. Not measured here.
+
+### 5. An in-process host
+
+If the shell is written in a language that has sockets, the connection is an ordinary object
+call and nothing forks: PowerShell 7 on .NET (`UnixDomainSocketEndPoint`), or xonsh on Python.
+These are not shell *features* — the interpreter is doing the work — but for Windows they are the
+only fork-free option, since no Windows shell has a socket builtin. Windows PowerShell 5.1 is on
+.NET Framework, which has no Unix socket endpoint at all: measured, the type does not exist.
 
 ## Summary
 
-| Shell | No-fork path                          | Forking path                          |
-| ----- | ------------------------------------- | ------------------------------------- |
-| zsh   | `zmodload zsh/net/socket` + `zsocket` | `socutil-cli`                         |
-| bash  | — (no built-in)                       | `coproc socutil-cli` (contained fork) |
-| fish  | — (no built-in)                       | `socutil-cli`                         |
+| Shell        | Native?          | Cheapest no-fork route                  | Fully fork-free?        |
+| ------------ | ---------------- | --------------------------------------- | ----------------------- |
+| zsh          | yes              | `zsocket`                               | yes, for text protocols |
+| bash         | no               | FIFO bridge, or `/dev/tcp` + TCP bridge | yes, per call           |
+| dash         | no               | FIFO bridge                             | yes, per call           |
+| ksh93        | no               | FIFO bridge, or `/dev/tcp` + TCP bridge | yes, per call           |
+| fish         | no               | FIFO bridge                             | yes, per call           |
+| PowerShell 7 | yes (in-process) | .NET socket                             | yes                     |
 
-The no-fork path is viable only in zsh. In bash and fish, the forking path is the only option,
-but bash's `coproc` keeps the fork contained within a function.
+The single-sentence version: **zsh can do it natively; every other shell can do it only if some
+long-lived process already owns the connection** — a FIFO bridge (universal), a TCP bridge
+(bash/ksh93 via `/dev/tcp`), or an in-process runtime (PowerShell 7, xonsh).
 
 ## The HTTP path
 
-When forking is not viable or not desirable, the `socutil` HTTP server provides a browser UI
-that proxies the socket over WebSocket and SSE. Start it with:
+When neither a fork nor a bridge is wanted, the `socutil` HTTP server proxies the socket to a
+browser UI over WebSocket and SSE:
 
 ```sh
 socutil --dir /path/to/socket-dir
 ```
 
-Then open the printed URL in a browser. The UI lists the sockets in the directory and lets you
-select one, open a WebSocket tunnel, and relay bytes interactively.
+Then open the printed URL: the UI lists the sockets in the directory, lets you select one, and
+relays bytes interactively.
 
-For `fsmeta serve`, the HTTP endpoint is optional, and the port is the only thing the flag
-chooses:
+`fsmeta serve` exposes the same thing optionally, and the port is the only thing the flag chooses:
 
 ```sh
 fsmeta serve /root --http        # port 8765
@@ -175,9 +235,8 @@ fsmeta serve /root --http=0      # any free port; the bound one is announced on 
 ```
 
 That starts the Unix-socket server (the binary protocol of `FORMAT.socket.md`) **and** an HTTP
-endpoint exposing the fs-meta socket through the socutil browser UI. With `--http=0` the server
-prints `socutil listening on http://127.0.0.1:<port>/`, which is how a script learns the port it
-got — useful when several servers must coexist on one machine.
+endpoint over it. With `--http=0` the server prints `socutil listening on http://127.0.0.1:<port>/`,
+which is how a script learns the port it got — useful when several servers must coexist.
 
 The flag belongs to `serve` alone: any other command given it fails with
 `fsmeta: --http is only valid for the serve command`.
