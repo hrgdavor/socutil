@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "The browser UI and shell client for unix-domain sockets.",
+  "scripts": {
+    "test": "bun run-tests.mjs",
+    "test:ui": "bun ui-smoke.mjs",
+    "build": "bun build.mjs"
+  }
+}

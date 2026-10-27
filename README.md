@@ -43,13 +43,16 @@ The source is written against **Zig 0.17**, which moved the whole I/O surface (`
 From the project root:
 
 ```sh
-bun check-zig.mjs                  # verify the toolchain first
-zig build                          # -> zig-out/bin/socutil[.exe] and socutil-cli[.exe]
+bun run build                      # the build, with the Zig this project requires
+bun check-zig.mjs                  # just verify the toolchain
+zig build                          # only when `zig` on PATH is already 0.17
 zig build run -- --dir /run        # build and run, arguments after `--` passed through
 ```
 
-`zig build` uses the `zig` on `PATH`; when that is an older compiler, call the recorded path directly
-(`D:\wrk\zig\17\zig.exe build`).
+`bun run build` is `build.mjs`, which resolves the compiler through `check-zig.mjs` and then runs it. That
+matters on a machine whose `PATH` has an older Zig first: a bare `zig build` would pick 0.16 and be refused,
+while `bun run build` finds the recorded 0.17. A bare `zig build` uses the `zig` on `PATH`; to force a
+specific compiler for either form, set `ZIG` (or pass `--zig` to `check-zig.mjs`).
 
 ```sh
 socutil                              # scan the platform defaults, listen on 127.0.0.1:8765
@@ -189,13 +192,33 @@ to or written.
 
 ## Tests
 
-Run these from the project root:
+From the project root, build once, then run the default suite with one command:
 
 ```sh
-zig build test     # unit tests: session-id validation, query decoding, JSON escaping, suffixes
-bun e2e.mjs        # end-to-end: fixture socket, real server, raw HTTP + SSE + WebSocket
-bun ui-smoke.mjs   # the page in a real browser: both transports, list to disconnect
+bun run build      # -> zig-out/bin/socutil[.exe] and socutil-cli[.exe]
+bun run test       # the default suite: toolchain check, end-to-end test, CLI test
 ```
+
+`bun run test` runs `run-tests.mjs`, which executes the steps below in order and stops at the first
+failure. The runner only orchestrates — order, a bounded timeout per step, one line per step, a final
+summary and a non-zero exit — and each script keeps its own assertions and `ok`/`PASS` output. A missing
+build artifact is reported with the command that produces it (`bun run build`) rather than being skipped.
+
+| Script          | What it covers                                      | In `bun run test`     |
+| --------------- | --------------------------------------------------- | --------------------- |
+| `check-zig.mjs` | resolves and validates the Zig 0.17 toolchain       | yes, first            |
+| `e2e.mjs`       | the HTTP server end to end, both transports         | yes                   |
+| `cli-test.mjs`  | `socutil-cli` against a live fs-meta socket         | yes                   |
+| `ui-smoke.mjs`  | the page in a real browser                          | no, `bun run test:ui` |
+
+The browser smoke test needs a real Chromium-compatible browser and is slow, so it is opt-in:
+
+```sh
+bun run test:ui    # bun ui-smoke.mjs
+```
+
+The Zig unit tests are separate (`zig build test`: session-id validation, query decoding, JSON escaping,
+suffixes); `bun run test` is the process-level suite.
 
 The end-to-end test builds nothing: build first (it says so if the binary is missing). It starts the
 server on port 0, reads the port from the server's own startup line, and drives a real unix socket with a
@@ -204,6 +227,14 @@ selects the socket by the name the listing returned, refuses a path sent as a na
 parameter is not a selector at all. The WebSocket half also checks the 64 KiB refusal (`1009`), the version
 check and the upgrade requirement. Its fixture lives under the project's `.tmp/socutil-e2e/`, and it
 always tears the process and socket down, including on failure. Use `--exe <path>` to test another build.
+
+The CLI test needs both binaries: `zig-out/bin/socutil-cli[.exe]` from this project and
+`../fs-meta/zig-out/bin/fsmeta[.exe]` from fs-meta (`FSMETA_DIR` overrides that location). It creates a
+scratch trio under fs-meta's `.tmp/`, serves it with `fsmeta serve <root>`, and drives `socutil-cli` over
+`<root>/.fs-meta/socket`. It checks the HELLO frame byte for byte, that the greeting arrives before any
+`SUBSCRIBE` and with stdin still open, the replayed `START_BATCH`/`CHANGE_ENTRY`/`END_BATCH` frames, and
+that the client exits 0 when the peer closes even though stdin never did. Every wait is bounded, a 45 s
+watchdog turns a stuck run into a failure, and `--exe`/`--fsmeta` test other builds.
 
 The browser test is the half the end-to-end test cannot see — the page's own `WebSocket`/`EventSource`
 wiring, base64 or binary decoding, form, status line, and the name it sends — driven over the Chrome
@@ -226,4 +257,7 @@ one, and this one is an enhancement. Its profile and fixture live under the proj
 | `SHELL.md`              | calling Unix sockets from the shell; fork-skipping per shell         |
 | `check-zig.mjs`         | toolchain check: says which Zig to use instead of failing vaguely    |
 | `e2e.mjs`               | the end-to-end test, both transports                                 |
+| `cli-test.mjs`          | the CLI against a live fs-meta socket, frame by frame                |
 | `ui-smoke.mjs`          | the page exercised in a real browser, both transports                |
+| `run-tests.mjs`         | the `bun run test` runner: order, timeouts, summary, exit code       |
+| `package.json`          | the house scripts: `test`, `test:ui`, `build`                        |
