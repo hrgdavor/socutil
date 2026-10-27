@@ -165,11 +165,19 @@ socutil --dir /path/to/socket-dir
 Then open the printed URL in a browser. The UI lists the sockets in the directory and lets you
 select one, open a WebSocket tunnel, and relay bytes interactively.
 
-For `fsmeta serve`, the HTTP endpoint is optional and takes no argument — it always binds 8765:
+For `fsmeta serve`, the HTTP endpoint is optional, and the port is the only thing the flag
+chooses:
 
 ```sh
-fsmeta serve /root --http
+fsmeta serve /root --http        # port 8765
+fsmeta serve /root --http=9000   # the port you name
+fsmeta serve /root --http=0      # any free port; the bound one is announced on stdout
 ```
 
-This starts the Unix-socket server (the binary protocol of `FORMAT.socket.md`) **and** an HTTP
-endpoint on port 8765 that exposes the fs-meta socket through the socutil browser UI.
+That starts the Unix-socket server (the binary protocol of `FORMAT.socket.md`) **and** an HTTP
+endpoint exposing the fs-meta socket through the socutil browser UI. With `--http=0` the server
+prints `socutil listening on http://127.0.0.1:<port>/`, which is how a script learns the port it
+got — useful when several servers must coexist on one machine.
+
+The flag belongs to `serve` alone: any other command given it fails with
+`fsmeta: --http is only valid for the serve command`.
