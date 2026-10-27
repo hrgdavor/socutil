@@ -93,7 +93,11 @@ Discovery differs by platform, and the difference is not cosmetic:
 - **Windows** — an `AF_UNIX` socket is a reparse point. A directory entry shows up as a symlink and
   `statFile` fails with `IO_REPARSE_TAG_NOT_HANDLED`, so there is no portable way to tell it from an
   ordinary symlink without connecting. Windows therefore uses the **name convention**: an entry ending in
-  `.sock` or `.socket` (case-insensitive) is offered as a socket. Name your Windows sockets accordingly.
+  `.sock` or `.socket` is offered as a socket, and so is one whose whole name is `socket` — both
+  case-insensitive. The bare name exists because an endpoint is not always spelled with a suffix: fs-meta
+  publishes `<root>/.fs-meta/socket`, and on Windows, where `stat` cannot follow the reparse point, that
+  name is all the scanner has, so without it that directory listed nothing at all. Name your Windows
+  sockets accordingly.
 
 A directory that cannot be opened is logged and skipped — one bad default directory must not hide the
 sockets in the rest.
