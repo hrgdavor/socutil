@@ -251,11 +251,14 @@ to end with `\x00\x01\xffAB` in both shells: sent `00 01 ff 41 42`, received `00
 
 ### bash: a builtin plus a function
 
-Build once (`shell/sock.zig` ships with socutil; it cross-compiles from any host):
+Build once (`shell/sock.zig` ships with socutil; it cross-compiles from any host). Run it from the
+`shell/` directory: `--name` puts the object where you are standing, and `-femit-bin` refuses a
+`.so` argument.
 
 ```sh
+cd shell
 zig build-lib -dynamic -fPIC -O ReleaseSafe -fstrip -fallow-shlib-undefined \
-    -target x86_64-linux-gnu.2.31 -lc --name sock shell/sock.zig
+    -target x86_64-linux-gnu.2.31 -lc --name sock sock.zig      # -> ./libsock.so
 ```
 
 Put the `.so` somewhere stable and load it in `~/.bashrc`:
