@@ -7,3 +7,5 @@ zig-out/
 
 # The bash builtin's build output (see SHELL.md)
 shell/*.so
+shell/tiny
+shell/cli_tiny

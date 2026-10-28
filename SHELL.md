@@ -44,6 +44,44 @@ printf 'hello\n' | socutil-cli /path/to/socket
 `socutil-cli` is a drop-in replacement for `socat - UNIX-CONNECT:/path`: stdin goes to the socket,
 the socket's output goes to stdout, and it exits when either side closes.
 
+### The same thing, small enough to be free
+
+`socutil-cli` is a full duplex relay: it builds an `Io.Threaded` event loop and starts two pump
+threads. That machinery is what a transfer *can* need, and it is also what a request/response client
+pays for on every call. `shell/cli_tiny.zig` is the other shape — read stdin, connect, send,
+half-close, stream the reply — with no `std.Io`, no threads and no allocator:
+
+```sh
+cd shell
+zig build-exe -target x86_64-linux-musl -O ReleaseSmall -fstrip -fsingle-threaded \
+    --name tiny cli_tiny.zig          # -> ./tiny, ~155 KB, statically linked
+tiny /path/to/socket < request > reply
+```
+
+Measured on 100 calls, three repetitions, against the same daemon:
+
+| client                   | ms/call         | what it is                                       |
+| ------------------------ | --------------- | ------------------------------------------------ |
+| **`tiny`**               | **0.57 – 0.60** | statically linked, single-threaded, no allocator |
+| `socutil-cli`            | 1.05 – 1.10     | dynamic, `Io.Threaded`, two pump threads         |
+| `sock -p` (bash builtin) | 0.14            | no process at all                                |
+| `/bin/true`              | 0.55 – 0.61     | the fork+exec floor                              |
+
+Two conclusions, and the second is the one that matters:
+
+- **Almost all of `socutil-cli`'s cost is startup, not work.** It finishes within 0.02 ms of
+  `/bin/true`, so once the process is that small there is nothing left to optimise — a byte pump
+  against a daemon cannot get below the cost of starting a process.
+- **A socket type cannot be chosen by the client.** `tiny` connects with `SOCK_STREAM` because the
+  type is fixed by the listener, and `fsmeta serve` and `socutil` both listen with `SOCK_STREAM`. A
+  `SOCK_SEQPACKET` connect to a stream listener fails with `EPROTOTYPE`; SEQPACKET would only work
+  against a daemon that also listens with SEQPACKET. There is also nothing to gain: this client has
+  no framing code — it copies bytes — so message boundaries would remove nothing.
+
+Use `tiny` when a script calls a daemon in a loop and the daemon answers fast; use `socutil-cli` when
+you need a live bidirectional session (`tiny` buffers its whole input first, up to 64 KiB); use
+`sock -p` when the shell is bash and the call is hot.
+
 ## zsh: the socket is a file descriptor
 
 zsh ships a socket module. The name matters: it is `zsh/net/socket`, **not** `zsh/socket`.
