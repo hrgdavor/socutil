@@ -31,6 +31,32 @@ const net = Io.net;
 
 const buf_len: usize = 8192;
 
+/// When the relay last moved a byte, on the monotonic clock, shared by the pumps and the watchdog.
+/// Only meaningful when `-t` was given; the default keeps the old "wait as long as the peer does".
+var last_activity_ns: std.atomic.Value(u64) = .init(0);
+
+fn touch(io: Io) void {
+    last_activity_ns.store(@intCast(Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds), .monotonic);
+}
+
+/// The opt-in idle timeout. A watchdog thread rather than a read timeout on purpose: the timeout is
+/// about *either* direction being quiet, and a socket receive timeout would fire while stdin was
+/// still streaming. It sleeps in short steps so the deadline is honest to within that step.
+fn watchdog(io: Io, timeout_ms: u64) void {
+    const timeout_ns = timeout_ms * std.time.ns_per_ms;
+    const step_ms: u64 = @max(1, @min(50, timeout_ms / 4));
+    while (true) {
+        io.sleep(.fromMilliseconds(@intCast(step_ms)), .awake) catch {};
+        const now: u64 = @intCast(Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds);
+        const last = last_activity_ns.load(.monotonic);
+        if (now > last and now - last >= timeout_ns) {
+            std.debug.print("socutil-cli: no activity before the timeout\n", .{});
+            // 124 is what timeout(1) uses, and what tiny exits with.
+            std.process.exit(124);
+        }
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
@@ -38,6 +64,7 @@ pub fn main(init: std.process.Init) !void {
 
     var socket_path: ?[]const u8 = null;
     var verbose = false;
+    var timeout_ms: ?u64 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -46,6 +73,16 @@ pub fn main(init: std.process.Init) !void {
             return;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             verbose = true;
+        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--timeout")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("socutil-cli: -t needs a number of milliseconds\n\n", .{});
+                std.process.exit(2);
+            }
+            timeout_ms = std.fmt.parseInt(u64, args[i], 10) catch {
+                std.debug.print("socutil-cli: -t needs a number of milliseconds\n\n", .{});
+                std.process.exit(2);
+            };
         } else if (arg.len != 0 and arg[0] == '-') {
             std.debug.print("socutil-cli: unknown option {s}\n\n", .{arg});
             printUsage();
@@ -91,6 +128,16 @@ pub fn main(init: std.process.Init) !void {
     var socket_reader = stream.reader(io, &socket_read_buf);
     var socket_writer = stream.writer(io, &socket_write_buf);
 
+    // Only started when asked: the default costs no thread, which is why `-t` is opt-in.
+    touch(io);
+    if (timeout_ms) |ms| {
+        const watcher = std.Thread.spawn(.{}, watchdog, .{ io, ms }) catch |err| {
+            std.debug.print("socutil-cli: cannot start the timeout: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        watcher.detach();
+    }
+
     const t1 = std.Thread.spawn(.{}, pumpStdinToSocket, .{StdinPump{
         .io = io,
         .stdin = stdin,
@@ -105,6 +152,7 @@ pub fn main(init: std.process.Init) !void {
     t1.detach();
 
     const t2 = std.Thread.spawn(.{}, pumpSocketToStdout, .{SocketPump{
+        .io = io,
         .reader = &socket_reader.interface,
         .stdout_writer = &stdout_writer.interface,
     }}) catch |err| {
@@ -124,6 +172,7 @@ fn pumpStdinToSocket(args: StdinPump) void {
         // `error.EndOfStream`), unlike a buffered reader that fills its buffer.
         const n = args.stdin.readStreaming(args.io, &.{&buf}) catch break;
         if (n == 0) break;
+        touch(args.io);
         args.socket_writer.writeAll(buf[0..n]) catch break;
         args.socket_writer.flush() catch break;
     }
@@ -152,6 +201,7 @@ fn pumpSocketToStdout(args: SocketPump) void {
             },
         };
         if (n == 0) break;
+        touch(args.io);
         args.stdout_writer.writeAll(buf[0..n]) catch {
             ok = false;
             break;
@@ -172,6 +222,7 @@ const StdinPump = struct {
 };
 
 const SocketPump = struct {
+    io: Io,
     reader: *Io.Reader,
     stdout_writer: *Io.Writer,
 };
@@ -184,8 +235,12 @@ fn printUsage() void {
         \\socket to stdout, byte for byte. A socat alternative for the shell.
         \\
         \\options:
-        \\  -v, --verbose   print connection progress to stderr
-        \\  -h, --help      show this help
+        \\  -t, --timeout <ms>  give up when neither side moves for this long (default: wait)
+        \\  -v, --verbose       print connection progress to stderr
+        \\  -h, --help          show this help
+        \\
+        \\The timeout is an idle timeout and exits with status 124, the same code `timeout(1)`
+        \\uses. Without it the relay waits as long as the peer does.
         \\
         \\Examples:
         \\  echo "ping" | socutil-cli /tmp/myapp.sock
@@ -196,3 +251,4 @@ fn printUsage() void {
         \\
     , .{});
 }
+

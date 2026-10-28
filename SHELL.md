@@ -119,10 +119,15 @@ shell. Two things still belong to `socutil-cli`:
 
 Nothing else was left: the buffering, the 64 KiB ceiling and the "cannot answer while writing" limit
 were properties of the first `tiny` implementation, and the `poll` loop removed them without costing
-time. `tiny` now has the opt-in `-t` timeout; `socutil-cli` still does not, and adding one there is
-harder than it looks — its relay is two threads, and ending a transfer that is blocked in a read
-needs either a cancellation the threads cooperate with or a socket receive timeout, not a `poll`
-argument.
+time.
+
+**Both clients now take the same `-t` flag and behave identically.** `tiny` passes it to `poll`;
+`socutil-cli` cannot — its relay is two threads blocked in reads — so it runs a watchdog thread over
+an atomic "last moved" stamp that both pumps update. Same flag, same idle semantics, same message
+modulo the program name, same exit code 124. Measured side by side against a server that accepts and
+never answers: `tiny` 502 ms, `socutil-cli` 504 ms, both exit 124; without the flag both are still
+waiting two seconds later; a non-numeric argument exits 2 from either with the same wording. The
+watchdog thread is started only when `-t` is given, so the default costs nothing.
 
 ## zsh: the socket is a file descriptor
 
