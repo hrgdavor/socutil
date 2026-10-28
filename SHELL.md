@@ -402,18 +402,36 @@ Measured on both shells against a real socket: text round trip, binary round tri
 
 ## Summary
 
-| Shell        | Native?                        | Cheapest no-fork route                               | Fully fork-free?        |
-| ------------ | ------------------------------ | ---------------------------------------------------- | ----------------------- |
-| zsh          | yes                            | `zsocket`                                            | yes, for text protocols |
-| bash         | no, unless a builtin is loaded | FIFO bridge, `/dev/tcp` + TCP bridge, or `enable -f` | yes, per call           |
-| dash         | no                             | FIFO bridge                                          | yes, per call           |
-| ksh93        | no                             | FIFO bridge, or `/dev/tcp` + TCP bridge              | yes, per call           |
-| fish         | no                             | FIFO bridge                                          | yes, per call           |
-| PowerShell 7 | yes (in-process)               | .NET socket                                          | yes                     |
+**Reach for `tiny` first.** It is the answer that works everywhere, and a process cannot be made
+faster than it already is:
 
-The single-sentence version: **zsh can do it natively; every other shell can do it only if some
-long-lived process already owns the connection** — a FIFO bridge (universal), a TCP bridge
-(bash/ksh93 via `/dev/tcp`), or an in-process runtime (PowerShell 7, xonsh).
+| what                       | per call    | reach                                         | measured |
+| -------------------------- | ----------- | --------------------------------------------- | -------- |
+| `sock -p` (bash builtin)   | 0.13 ms     | bash only, needs a `.so` loaded at startup    | yes      |
+| **`tiny`** (static binary) | **0.58 ms** | every shell, nothing to install               | yes      |
+| `socutil-cli`              | 1.05 ms     | every shell, and a live bidirectional session | yes      |
+| `/bin/true`                | 0.56 ms     | the floor: any external command costs this    | yes      |
+
+Over 1000 calls that is 0.13 s against 0.58 s — four times, but both are "fast", and only one of them
+runs in `dash`, `fish`, `sh`, `ksh93`, a Makefile or a cron entry. `tiny` finishes within 0.03 ms of
+`/bin/true`, so the only way to go faster is to not start a process at all, which is what the builtin
+does and why it stays as the bash-only optimisation.
+
+The zero-install routes, when even a 155 KB binary is too much:
+
+| Shell        | Native?                        | Cheapest no-fork route                                | Fully fork-free?        |
+| ------------ | ------------------------------ | ----------------------------------------------------- | ----------------------- |
+| zsh          | yes                            | `zsocket`                                             | yes, for text protocols |
+| bash         | no, unless a builtin is loaded | FIFO bridge, `/dev/tcp` + TCP bridge, or `enable -f`  | yes, per call           |
+| dash         | no                             | FIFO bridge                                           | yes, per call           |
+| ksh93        | no                             | FIFO bridge, or `/dev/tcp` + TCP bridge               | yes, per call           |
+| fish         | no                             | FIFO bridge                                           | yes, per call           |
+| PowerShell 7 | yes (in-process)               | .NET socket                                           | yes                     |
+
+The single-sentence version: **zsh can do it natively; every other shell can do it either by running
+one small static binary (`tiny`), or — with no binary at all — only if some long-lived process already
+owns the connection**: a FIFO bridge (universal), a TCP bridge (bash/ksh93 via `/dev/tcp`), or an
+in-process runtime (PowerShell 7, xonsh).
 
 ## The HTTP path
 
