@@ -266,18 +266,48 @@ Put the `.so` somewhere stable and load it in `~/.bashrc`:
 ```bash
 enable -f /usr/local/lib/socutil/libsock.so sock 2>/dev/null && enable sock 2>/dev/null
 
-fsmeta() {
-    local sockpath=$1
-    local fd reader
-    sock -a fd "$sockpath" || return 1     # connect; $fd is ours
-    cat <&$fd &                            # reader: socket -> stdout
+# The whole command. One builtin call: no child process, and bytes are copied by read/write
+# inside the builtin, so binary is exact.
+fsmeta() { sock -p "$1"; }
+```
+
+`sock -p` connects, relays stdin to the socket and the socket to stdout, half-closes on stdin
+end-of-stream, and returns when the peer closes. Nothing is forked and no byte passes through a
+variable.
+
+Measured on 50 calls, against a live daemon:
+
+| path                       | per call    | forks |
+| -------------------------- | ----------- | ----- |
+| **`sock -p`**              | **0.16 ms** | **0** |
+| `sock -a` + `cat`          | 1.12 ms     | 1     |
+| `socutil-cli`              | 1.12 ms     | 1     |
+| builtin text via `read -u` | 0.12 ms     | 0     |
+| connect + close            | 0.06 ms     | 0     |
+
+The `cat` row is why `-p` exists: at ~1 ms a process costs six times a whole round trip, and that
+cost is paid per call however fast the daemon is.
+
+If you would rather hold the descriptor and drive it yourself (several requests on one connection,
+or a protocol you parse in the shell), `-a`/`-w`/`-c` still expose it:
+
+```bash
+fsmeta_fd() {
+    local sockpath=$1 fd reader
+    sock -a fd "$sockpath" || return 1
+    cat <&$fd &
     reader=$!
-    cat >&$fd                              # writer: stdin -> socket
+    cat >&$fd
     sock -w "$fd"                          # FIN, so a peer waiting for EOF can answer
     wait "$reader"
     sock -c "$fd"
 }
 ```
+
+`sock -w` is the part that is not obvious. Closing your copy of the descriptor does **not** signal
+end-of-stream while the `cat` holding a duplicate still exists; only `shutdown(SHUT_WR)` sends FIN.
+Without it, a server that answers "after reading everything" waits forever. That was measured: with
+`-w` the reply arrives, without it the call hangs.
 
 ```sh
 printf 'hello\n' | fsmeta /path/to/socket          # text

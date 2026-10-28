@@ -72,9 +72,58 @@ extern fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
 extern fn shutdown(fd: c_int, how: c_int) c_int;
 extern fn close(fd: c_int) c_int;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
+extern fn poll(fds: [*]PollFd, count: c_ulong, timeout: c_int) c_int;
 // `bind_variable` returns a `SHELL_VAR *`, not an int: declaring it as c_int truncates the pointer
 // and the success check becomes a coin flip on the low 32 bits.
 extern fn bind_variable(name: [*:0]const u8, value: [*:0]u8, flags: c_int) ?*anyopaque;
+
+const POLLIN: c_short = 0x001;
+const POLLERR: c_short = 0x008;
+const POLLHUP: c_short = 0x010;
+const STDIN: c_int = 0;
+const STDOUT: c_int = 1;
+
+const PollFd = extern struct {
+    fd: c_int,
+    events: c_short,
+    revents: c_short,
+};
+
+/// Write the whole slice, retrying short writes. Returns false on any error.
+fn writeAll(fd: c_int, bytes: []const u8) bool {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const written = write(fd, bytes.ptr + offset, bytes.len - offset);
+        if (written <= 0) return false;
+        offset += @intCast(written);
+    }
+    return true;
+}
+
+/// Connect to an AF_UNIX stream socket, or null. The descriptor is returned open; the caller owns it.
+fn connectSocket(path: [*:0]const u8) ?c_int {
+    const target = std.mem.span(path);
+    var address = std.mem.zeroes(SockaddrUn);
+    address.family = AF_UNIX;
+    if (target.len >= address.path.len) {
+        complain("sock: socket path too long\n");
+        return null;
+    }
+    @memcpy(address.path[0..target.len], target);
+
+    const fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        complain("sock: cannot create socket\n");
+        return null;
+    }
+    if (connect(fd, @ptrCast(&address), @sizeOf(SockaddrUn)) != 0) {
+        complain("sock: cannot connect\n");
+        _ = close(fd);
+        return null;
+    }
+    return fd;
+}
 
 fn complain(message: []const u8) void {
     _ = write(2, message.ptr, message.len);
@@ -124,25 +173,7 @@ fn renderDescriptor(buffer: *[16]u8, fd: c_int) [:0]u8 {
 }
 
 fn connectCommand(name: [*:0]const u8, path: [*:0]const u8) c_int {
-    const target = std.mem.span(path);
-    var address = std.mem.zeroes(SockaddrUn);
-    address.family = AF_UNIX;
-    if (target.len >= address.path.len) {
-        complain("sock: socket path too long\n");
-        return 1;
-    }
-    @memcpy(address.path[0..target.len], target);
-
-    const fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        complain("sock: cannot create socket\n");
-        return 1;
-    }
-    if (connect(fd, @ptrCast(&address), @sizeOf(SockaddrUn)) != 0) {
-        complain("sock: cannot connect\n");
-        _ = close(fd);
-        return 1;
-    }
+    const fd = connectSocket(path) orelse return 1;
 
     var buffer: [16]u8 = undefined;
     const rendered = renderDescriptor(&buffer, fd);
@@ -154,12 +185,73 @@ fn connectCommand(name: [*:0]const u8, path: [*:0]const u8) c_int {
     return 0;
 }
 
+/// `-p`: connect and relay stdin to the socket and the socket to stdout, entirely inside the builtin.
+///
+/// This is what makes the command cost nothing: a bash function that connects and then runs `cat`
+/// pays for a process (~1 ms measured), which is ten times the cost of a zero-fork text round trip.
+/// Doing the copy here removes that: one builtin call, no child, and bytes are copied by `read`/
+/// `write` so NUL and arbitrary binary are untouched.
+///
+/// The shape is the relay `socutil-cli` implements — `poll` both directions, half-close on stdin
+/// end-of-stream, stop when the peer closes — with one difference: it returns instead of exiting,
+/// because the process belongs to bash.
+fn pumpCommand(path: [*:0]const u8) c_int {
+    const fd = connectSocket(path) orelse return 1;
+
+    var buffer: [16384]u8 = undefined;
+    var stdin_open = true;
+    var socket_open = true;
+
+    while (socket_open) {
+        var fds = [2]PollFd{
+            .{ .fd = STDIN, .events = if (stdin_open) POLLIN else 0, .revents = 0 },
+            .{ .fd = fd, .events = POLLIN, .revents = 0 },
+        };
+        const ready = poll(&fds, fds.len, -1);
+        if (ready < 0) break;
+
+        // Any revents means "ask this descriptor": a pipe at end-of-stream reports POLLHUP without
+        // POLLIN, and reading is the only reliable way to learn that. Testing POLLIN alone leaves the
+        // pump spinning and never sends the FIN the peer is waiting for.
+        if (stdin_open and fds[0].revents != 0) {
+            const got = read(STDIN, &buffer, buffer.len);
+            if (got <= 0) {
+                // End of input: FIN, so a peer that answers after reading everything can answer.
+                stdin_open = false;
+                _ = shutdown(fd, SHUT_WR);
+            } else if (!writeAll(fd, buffer[0..@intCast(got)])) {
+                break;
+            }
+        }
+
+        if (fds[1].revents != 0) {
+            const got = read(fd, &buffer, buffer.len);
+            if (got <= 0) {
+                socket_open = false;
+                break;
+            }
+            if (!writeAll(STDOUT, buffer[0..@intCast(got)])) break;
+        }
+    }
+
+    _ = close(fd);
+    return 0;
+}
+
 fn sockCommand(list: ?*WordList) callconv(.c) c_int {
     const option = argument(list, 0) orelse {
-        complain("sock: usage: sock -a VAR PATH | -w FD | -c FD\n");
+        complain("sock: usage: sock -p PATH | -a VAR PATH | -w FD | -c FD\n");
         return 2;
     };
     const flag = std.mem.span(option);
+
+    if (std.mem.eql(u8, flag, "-p")) {
+        const path = argument(list, 1) orelse {
+            complain("sock: -p needs a socket path\n");
+            return 2;
+        };
+        return pumpCommand(path);
+    }
 
     if (std.mem.eql(u8, flag, "-a")) {
         const name = argument(list, 1) orelse {
@@ -203,7 +295,7 @@ fn sockCommand(list: ?*WordList) callconv(.c) c_int {
         return 0;
     }
 
-    complain("sock: usage: sock -a VAR PATH | -w FD | -c FD\n");
+    complain("sock: usage: sock -p PATH | -a VAR PATH | -w FD | -c FD\n");
     return 2;
 }
 
