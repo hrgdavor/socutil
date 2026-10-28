@@ -197,7 +197,54 @@ fn connectCommand(name: [*:0]const u8, path: [*:0]const u8) c_int {
 /// because the process belongs to bash.
 fn pumpCommand(path: [*:0]const u8) c_int {
     const fd = connectSocket(path) orelse return 1;
+    return pumpFds(fd);
+}
 
+/// Write a decimal number without a formatter.
+fn writeDecimal(fd: c_int, value: usize) bool {
+    var digits: [20]u8 = undefined;
+    var count: usize = 0;
+    var remaining = value;
+    if (remaining == 0) {
+        digits[0] = '0';
+        count = 1;
+    } else {
+        while (remaining > 0) : (remaining /= 10) {
+            digits[count] = '0' + @as(u8, @intCast(remaining % 10));
+            count += 1;
+        }
+    }
+    var out: [20]u8 = undefined;
+    var index: usize = 0;
+    while (index < count) : (index += 1) out[index] = digits[count - 1 - index];
+    return writeAll(fd, out[0..count]);
+}
+
+/// `-x`: the `{{` dialect. The header carries the executable's parameters and environment; everything
+/// after it is the program's stdin, and the reply is its stdout. Then it relays exactly like `-p`.
+fn execCommand(path: [*:0]const u8, argv: []const []const u8, envp: []const []const u8) c_int {
+    const fd = connectSocket(path) orelse return 1;
+
+    var ok = writeAll(fd, "{{ exec ") and writeDecimal(fd, argv.len) and writeAll(fd, " ") and
+        writeDecimal(fd, envp.len) and writeAll(fd, "\n");
+    for (argv) |field| {
+        if (!ok) break;
+        ok = writeDecimal(fd, field.len) and writeAll(fd, " ") and writeAll(fd, field) and writeAll(fd, "\n");
+    }
+    for (envp) |field| {
+        if (!ok) break;
+        ok = writeDecimal(fd, field.len) and writeAll(fd, " ") and writeAll(fd, field) and writeAll(fd, "\n");
+    }
+    if (!ok) {
+        complain("sock: cannot write the exec header\n");
+        _ = close(fd);
+        return 1;
+    }
+    return pumpFds(fd);
+}
+
+/// Relay between stdin/stdout and a connected descriptor, then close it.
+fn pumpFds(fd: c_int) c_int {
     var buffer: [16384]u8 = undefined;
     var stdin_open = true;
     var socket_open = true;
@@ -251,6 +298,47 @@ fn sockCommand(list: ?*WordList) callconv(.c) c_int {
             return 2;
         };
         return pumpCommand(path);
+    }
+
+    if (std.mem.eql(u8, flag, "-x")) {
+        const path = argument(list, 1) orelse {
+            complain("sock: -x needs a socket path\n");
+            return 2;
+        };
+        var argv_buffer: [64][]const u8 = undefined;
+        var env_buffer: [64][]const u8 = undefined;
+        var argc: usize = 0;
+        var envc: usize = 0;
+        var index: usize = 2;
+        // `-e NAME=VALUE` pairs come before the program word.
+        while (true) {
+            const word = argument(list, index) orelse break;
+            if (!std.mem.eql(u8, std.mem.span(word), "-e")) break;
+            const pair = argument(list, index + 1) orelse {
+                complain("sock: -e needs NAME=VALUE\n");
+                return 2;
+            };
+            if (envc == env_buffer.len) {
+                complain("sock: too many environment entries\n");
+                return 2;
+            }
+            env_buffer[envc] = std.mem.span(pair);
+            envc += 1;
+            index += 2;
+        }
+        while (argument(list, index)) |word| : (index += 1) {
+            if (argc == argv_buffer.len) {
+                complain("sock: too many arguments\n");
+                return 2;
+            }
+            argv_buffer[argc] = std.mem.span(word);
+            argc += 1;
+        }
+        if (argc == 0) {
+            complain("sock: -x needs a program to run\n");
+            return 2;
+        }
+        return execCommand(path, argv_buffer[0..argc], env_buffer[0..envc]);
     }
 
     if (std.mem.eql(u8, flag, "-a")) {
