@@ -255,6 +255,7 @@ one, and this one is an enhancement. Its profile and fixture live under the proj
 | `src/sockets.zig`       | socket discovery and the platform rules above                        |
 | `src/ui/`               | the page, script and stylesheet, embedded at build time              |
 | `SHELL.md`              | calling Unix sockets from the shell; fork-skipping per shell         |
+| `shell/sock.zig`        | the bash loadable builtin: connect, half-close, close (see SHELL.md) |
 | `check-zig.mjs`         | toolchain check: says which Zig to use instead of failing vaguely    |
 | `e2e.mjs`               | the end-to-end test, both transports                                 |
 | `cli-test.mjs`          | the CLI against a live fs-meta socket, frame by frame                |

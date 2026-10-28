@@ -203,7 +203,7 @@ const Builtin = extern struct {
     handle: ?*anyopaque,
 };
 
-extern fn bind_variable(name: [*:0]const u8, value: ?[*:0]u8, flags: c_int) c_int;
+extern fn bind_variable(name: [*:0]const u8, value: ?[*:0]u8, flags: c_int) ?*anyopaque;   // SHELL_VAR *, not int
 
 // `var`, not `const`: bash writes its dlopen handle into this struct.
 export var probe_struct: Builtin = .{ ... };
@@ -239,6 +239,95 @@ call and nothing forks: PowerShell 7 on .NET (`UnixDomainSocketEndPoint`), or xo
 These are not shell *features* — the interpreter is doing the work — but for Windows they are the
 only fork-free option, since no Windows shell has a socket builtin. Windows PowerShell 5.1 is on
 .NET Framework, which has no Unix socket endpoint at all: measured, the type does not exist.
+
+## A command you can alias
+
+Both recipes below give you a command that behaves like an ordinary executable: one argument (the
+socket path), stdin in, stdout out, usable anywhere in a pipeline.
+
+**Binary passes through.** Bytes never enter a shell variable — the shell holds only the descriptor
+and `cat` moves the data kernel to kernel — so NUL and arbitrary bytes are unaffected. Verified end
+to end with `\x00\x01\xffAB` in both shells: sent `00 01 ff 41 42`, received `00 01 ff 41 42`.
+
+### bash: a builtin plus a function
+
+Build once (`shell/sock.zig` ships with socutil; it cross-compiles from any host):
+
+```sh
+zig build-lib -dynamic -fPIC -O ReleaseSafe -fstrip -fallow-shlib-undefined \
+    -target x86_64-linux-gnu.2.31 -lc --name sock shell/sock.zig
+```
+
+Put the `.so` somewhere stable and load it in `~/.bashrc`:
+
+```bash
+enable -f /usr/local/lib/socutil/libsock.so sock 2>/dev/null && enable sock 2>/dev/null
+
+fsmeta() {
+    local sockpath=$1
+    local fd reader
+    sock -a fd "$sockpath" || return 1     # connect; $fd is ours
+    cat <&$fd &                            # reader: socket -> stdout
+    reader=$!
+    cat >&$fd                              # writer: stdin -> socket
+    sock -w "$fd"                          # FIN, so a peer waiting for EOF can answer
+    wait "$reader"
+    sock -c "$fd"
+}
+```
+
+```sh
+printf 'hello\n' | fsmeta /path/to/socket          # text
+some-command | fsmeta /path/to/socket | grep ...   # in a pipeline
+fsmeta /path/to/socket < request.bin > reply.bin   # binary, unchanged
+```
+
+`sock -w` is the part that is not obvious. Closing your copy of the descriptor does **not** signal
+end-of-stream while the `cat` holding a duplicate still exists; only `shutdown(SHUT_WR)` sends FIN.
+Without it, a server that answers "after reading everything" waits forever. That was measured: with
+`-w` the reply arrives, without it the call hangs.
+
+### zsh: no artifact at all
+
+```zsh
+zmodload zsh/net/socket
+
+fsmeta() {
+    local sockpath=$1        # NOT `path`: see the pitfalls
+    local fd
+    zsocket "$sockpath" || return 1
+    fd=$REPLY
+    cat >&$fd                # send all of stdin
+    cat <&$fd                # then read every reply byte
+    exec {fd}>&-
+}
+```
+
+Measured on both shells against a real socket: text round trip, binary round trip, pipeline filter,
+`grep`, and five sequential calls with no descriptor leak.
+
+### What each recipe honestly cannot do
+
+- **zsh has no half-close.** There is no `shutdown` builtin, and closing your copy cannot send FIN
+  while another process holds a duplicate. So a server that replies only after end-of-stream will
+  hang with the zsh recipe — use the bash one, `socutil-cli`, or a bridge for that peer. Protocols
+  that answer on a request boundary (fs-meta's replay does) are fine.
+- **The bash builtin is Linux-shaped as written**: `sockaddr_un.path` is the Linux layout, and the
+  flag constants are Linux values. Porting is a struct and two constants, but it has not been done.
+- **Both still fork `cat`** for the byte copy. The *connection* costs no process; the copy is one
+  `cat` per call, and that is what buys binary safety. A `read`/`print` loop would avoid the fork
+  and would also lose NUL bytes — the trade this section refuses to make.
+
+### Three pitfalls, each measured
+
+- **zsh: never name a variable `path`.** `path` is tied to `PATH`; `local path=$1` replaces the
+  search path with the socket name, and every command in the function then fails with
+  `command not found: cat`. This cost a debug cycle to find.
+- **bash: `enable -f` registers the builtin disabled.** Follow it with `enable <name>` in the same
+  shell — in a pipeline the enable runs in a subshell and is lost.
+- **The builtin's struct must be `var`, never `const`** (§ 4): bash writes its `dlopen` handle into
+  it, and a `const` in `.data.rel.ro` is read-only under full RELRO. A `one_of` here is a segfault
+  inside `enable -f`, not an error message.
 
 ## Summary
 

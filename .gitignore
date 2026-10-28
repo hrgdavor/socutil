@@ -4,3 +4,6 @@ zig-out/
 
 # Scratch: test fixtures and browser profiles (see README "Tests")
 .tmp/
+
+# The bash builtin's build output (see SHELL.md)
+shell/*.so
