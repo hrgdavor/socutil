@@ -56,7 +56,24 @@ cd shell
 zig build-exe -target x86_64-linux-musl -O ReleaseSmall -fstrip -fsingle-threaded \
     --name tiny cli_tiny.zig          # -> ./tiny, ~155 KB, statically linked
 tiny /path/to/socket < request > reply
+tiny -t 500 /path/to/socket < request > reply    # give up if nothing moves for 500 ms
 ```
+
+**The timeout is opt-in.** Without `-t` the relay waits as long as the peer does, which is the right
+default when the peer is a daemon that answers when it answers. With `-t <milliseconds>` it is an
+*idle* timeout — neither direction moving for that long ends the run — and the exit code is **124**,
+the one `timeout(1)` uses, so a script that already checks for that keeps working:
+
+```
+$ tiny -t 500 /path/to/silent-socket < request
+tiny: no activity before the timeout
+$ echo $?
+124
+```
+
+Measured against a server that accepts and never answers: exit 124 after 504 ms for `-t 500`. The
+same call without `-t` is still waiting two seconds later, and passing the flag costs nothing
+(1.200 vs 1.210 ms/call, inside noise).
 
 Measured on 100 calls, three repetitions, against the same daemon:
 
@@ -102,7 +119,10 @@ shell. Two things still belong to `socutil-cli`:
 
 Nothing else was left: the buffering, the 64 KiB ceiling and the "cannot answer while writing" limit
 were properties of the first `tiny` implementation, and the `poll` loop removed them without costing
-time. A timeout flag is still missing from both, and is the one feature worth adding next.
+time. `tiny` now has the opt-in `-t` timeout; `socutil-cli` still does not, and adding one there is
+harder than it looks — its relay is two threads, and ending a transfer that is blocked in a read
+needs either a cancellation the threads cooperate with or a socket receive timeout, not a `poll`
+argument.
 
 ## zsh: the socket is a file descriptor
 

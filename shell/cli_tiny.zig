@@ -60,12 +60,54 @@ fn complain(message: []const u8) void {
 
 const STDERR_FILENO: i32 = 2;
 
+fn usage() void {
+    complain(
+        \\tiny: tiny [-t <milliseconds>] <socket-path>
+        \\  reads stdin, writes it to the socket, and copies the reply to stdout.
+        \\  -t, --timeout <ms>   give up when neither side moves for this long (default: wait)
+        \\
+    );
+}
+
+/// Exit code when the opt-in timeout fires: the same one `timeout(1)` uses, so a script that already
+/// checks for 124 keeps working.
+const timeout_exit: u8 = 124;
+
 pub fn main(init: std.process.Init) u8 {
     var args = std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa) catch return 2;
     defer args.deinit();
     _ = args.next(); // the program itself
-    const socket_path = args.next() orelse {
-        complain("tiny: usage: tiny <socket-path>  (request on stdin, reply on stdout)\n");
+
+    // Opt-in: without `-t` the relay waits forever, which is the old behaviour and the right default
+    // for a client whose peer is a daemon that answers when it answers.
+    var timeout_ms: ?i32 = null;
+    var socket_path: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            usage();
+            return 0;
+        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--timeout")) {
+            const text = args.next() orelse {
+                complain("tiny: -t needs a number of milliseconds\n");
+                return 2;
+            };
+            timeout_ms = std.fmt.parseInt(i32, text, 10) catch {
+                complain("tiny: -t needs a number of milliseconds\n");
+                return 2;
+            };
+            if (timeout_ms.? < 0) {
+                complain("tiny: -t needs a non-negative number of milliseconds\n");
+                return 2;
+            }
+        } else if (socket_path == null) {
+            socket_path = arg;
+        } else {
+            usage();
+            return 2;
+        }
+    }
+    const path = socket_path orelse {
+        usage();
         return 2;
     };
 
@@ -73,7 +115,7 @@ pub fn main(init: std.process.Init) u8 {
     //    session does not wait for end-of-stream to discover it cannot reach the peer.
     var address = std.mem.zeroes(SockaddrUn);
     address.family = AF_UNIX;
-    const target: []const u8 = socket_path;
+    const target: []const u8 = path;
     if (target.len >= address.path.len) {
         complain("tiny: socket path too long\n");
         return 1;
@@ -109,8 +151,13 @@ pub fn main(init: std.process.Init) u8 {
             .{ .fd = STDIN, .events = if (stdin_open) std.posix.POLL.IN else 0, .revents = 0 },
             .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
         };
-        const ready = std.posix.poll(&fds, -1) catch break;
-        if (ready == 0) continue;
+        const ready = std.posix.poll(&fds, timeout_ms orelse -1) catch break;
+        if (ready == 0) {
+            // Only reachable when `-t` was given: `poll` with -1 cannot return 0.
+            complain("tiny: no activity before the timeout\n");
+            _ = linux.close(fd);
+            return timeout_exit;
+        }
 
         // Any revents means "ask this descriptor": a pipe at end-of-stream reports POLLHUP without
         // POLLIN, and reading is the only reliable way to learn it. Checking POLLIN alone spins.
