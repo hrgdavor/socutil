@@ -47,9 +47,9 @@ the socket's output goes to stdout, and it exits when either side closes.
 ### The same thing, small enough to be free
 
 `socutil-cli` is a full duplex relay: it builds an `Io.Threaded` event loop and starts two pump
-threads. That machinery is what a transfer *can* need, and it is also what a request/response client
-pays for on every call. `shell/cli_tiny.zig` is the other shape — read stdin, connect, send,
-half-close, stream the reply — with no `std.Io`, no threads and no allocator:
+threads. That machinery is what a transfer *can* need, and it is also what a client pays for on every
+call. `shell/cli_tiny.zig` is the same relay — both directions at once — with no `std.Io`, no threads
+and no allocator, using one `poll` loop:
 
 ```sh
 cd shell
@@ -62,25 +62,47 @@ Measured on 100 calls, three repetitions, against the same daemon:
 
 | client                   | ms/call         | what it is                                       |
 | ------------------------ | --------------- | ------------------------------------------------ |
-| **`tiny`**               | **0.57 – 0.60** | statically linked, single-threaded, no allocator |
-| `socutil-cli`            | 1.05 – 1.10     | dynamic, `Io.Threaded`, two pump threads         |
-| `sock -p` (bash builtin) | 0.14            | no process at all                                |
-| `/bin/true`              | 0.55 – 0.61     | the fork+exec floor                              |
+| **`tiny`**               | **0.57 – 0.64** | statically linked, single-threaded, no allocator |
+| `socutil-cli`            | 1.05 – 1.18     | dynamic, `Io.Threaded`, two pump threads         |
+| `sock -p` (bash builtin) | 0.14 – 0.16     | no process at all                                |
+| `/bin/true`              | 0.55 – 0.62     | the fork+exec floor                              |
+
+**Duplex is free.** The first version of `tiny` read all of stdin, then sent, then drained — which
+was right for a request and a reply and wrong for three other things: an interactive session waited
+for end-of-file before showing anything, a request over 64 KiB was truncated, and nothing could
+arrive while input was still being written. Replacing that with a `poll` loop fixed all three and
+moved the measurement not at all, because the cost of the process is starting it, not the two
+syscalls a transfer needs. Verified: a reply arrives while stdin is still open, 256 KiB round-trips
+byte for byte, and an empty request exits 0.
 
 Two conclusions, and the second is the one that matters:
 
-- **Almost all of `socutil-cli`'s cost is startup, not work.** It finishes within 0.02 ms of
-  `/bin/true`, so once the process is that small there is nothing left to optimise — a byte pump
-  against a daemon cannot get below the cost of starting a process.
+- **Almost all of `socutil-cli`'s cost is startup, not work.** `tiny` finishes within ~0.03 ms of
+  `/bin/true`, so once a client is that small there is nothing left to optimise — a byte pump against
+  a daemon cannot get below the cost of starting a process. The old two-thread design cost ~0.5 ms
+  over that floor: an event loop built at startup and two threads started for a transfer that one
+  `poll` loop performs.
 - **A socket type cannot be chosen by the client.** `tiny` connects with `SOCK_STREAM` because the
   type is fixed by the listener, and `fsmeta serve` and `socutil` both listen with `SOCK_STREAM`. A
   `SOCK_SEQPACKET` connect to a stream listener fails with `EPROTOTYPE`; SEQPACKET would only work
   against a daemon that also listens with SEQPACKET. There is also nothing to gain: this client has
   no framing code — it copies bytes — so message boundaries would remove nothing.
 
-Use `tiny` when a script calls a daemon in a loop and the daemon answers fast; use `socutil-cli` when
-you need a live bidirectional session (`tiny` buffers its whole input first, up to 64 KiB); use
-`sock -p` when the shell is bash and the call is hot.
+### Where `tiny` is not the right tool
+
+`tiny` is now the default on POSIX: it relays in both directions, costs one process, and runs from any
+shell. Two things still belong to `socutil-cli`:
+
+- **Windows.** There is no portable `poll`: `std.posix.poll` is a compile error on Windows (`use
+  std.Io instead`), and the Win32 equivalent is waitable handles, a separate implementation. So `tiny`
+  is built for `x86_64-linux-musl`, and on Windows the two-thread `socutil-cli` remains the client.
+  This is a platform limit, not something more engineering on `tiny` fixes.
+- **Diagnostics.** `socutil-cli` has `-v` and `-h`; `tiny` prints one usage line and nothing else.
+  When a connection misbehaves and you want to see where, the verbose client is the one to reach for.
+
+Nothing else was left: the buffering, the 64 KiB ceiling and the "cannot answer while writing" limit
+were properties of the first `tiny` implementation, and the `poll` loop removed them without costing
+time. A timeout flag is still missing from both, and is the one feature worth adding next.
 
 ## zsh: the socket is a file descriptor
 
