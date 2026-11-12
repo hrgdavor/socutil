@@ -1,7 +1,11 @@
 name: test
 
 on:
+  # Branches only. A tag is the release workflow's event; without this filter a tag push ran this test
+  # suite *and* the release workflow, so one tag produced two workflow runs (plus a second test run when
+  # the same commit was also pushed to main).
   push:
+    branches: ['**']
   pull_request:
 
 jobs:
