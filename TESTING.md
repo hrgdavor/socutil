@@ -24,7 +24,7 @@ The browser smoke test needs a real Chromium-compatible browser and is slow, so 
 ```sh
 bun run test:ui    # bun ui-smoke.mjs
 ```
-
+ 
 The Zig unit tests are separate (`zig build test`: session-id validation, query decoding, JSON escaping,
 suffixes); `bun run test` is the process-level suite.
 
