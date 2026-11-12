@@ -1,0 +1,86 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create or update (for example v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # build.zig refuses any compiler but 0.17 on purpose.
+      - uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
+        with:
+          version: 0.17.0
+
+      - name: Build and package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          VERSION="${TAG#v}"
+          mkdir -p dist
+
+          for target in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos x86_64-windows; do
+            echo "::group::build $target"
+            zig build -Dtarget="$target" -Doptimize=ReleaseFast
+
+            pkg="socutil-${VERSION}-${target}"
+            mkdir -p "dist/$pkg"
+            if [[ "$target" == *windows* ]]; then
+              cp zig-out/bin/socutil.exe "dist/$pkg/socutil.exe"
+              cp zig-out/bin/socutil-cli.exe "dist/$pkg/socutil-cli.exe"
+            else
+              cp zig-out/bin/socutil "dist/$pkg/socutil"
+              cp zig-out/bin/socutil-cli "dist/$pkg/socutil-cli"
+            fi
+            cp README.md SHELL.md "dist/$pkg/"
+
+            # `tiny` is the Linux-only, no-allocator shell client from SHELL.md.
+            if [[ "$target" == *linux* ]]; then
+              (cd shell && zig build-exe \
+                -target "$target" -O ReleaseSmall -fstrip -fsingle-threaded \
+                -femit-bin="../dist/$pkg/tiny" cli_tiny.zig)
+            fi
+
+            if [[ "$target" == *windows* ]]; then
+              (cd dist && zip -qr "$pkg.zip" "$pkg")
+            else
+              tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"
+            fi
+            rm -rf "dist/$pkg"
+            echo "::endgroup::"
+          done
+
+          sha256sum dist/*.tar.gz dist/*.zip > dist/SHA256SUMS
+          ls -lh dist
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          VERSION="${TAG#v}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "socutil $VERSION" --generate-notes
+          fi
