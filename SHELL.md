@@ -49,20 +49,43 @@ the socket's output goes to stdout, and it exits when either side closes.
 `socutil-cli` is a full duplex relay: it builds an `Io.Threaded` event loop and starts two pump
 threads. That machinery is what a transfer *can* need, and it is also what a client pays for on every
 call. `shell/cli_tiny.zig` is the same relay — both directions at once — with no `std.Io`, no threads
-and no allocator, using one `poll` loop:
+and no allocator, using one `poll` loop. `tiny` also has an argument mode for a script call:
 
 ```sh
 cd shell
 zig build-exe -target x86_64-linux-musl -O ReleaseSmall -fstrip -fsingle-threaded \
     --name tiny cli_tiny.zig          # -> ./tiny, ~155 KB, statically linked
+
+# argument mode: argv[0], the script, then its parameters, one per line
+tiny --socket /path/to/socket /path/to/script.sh a b
+TINY_SOCKET=/path/to/socket tiny /path/to/script.sh a b
+
+# relay: stdin to the socket, the reply to stdout
 tiny /path/to/socket < request > reply
+tiny --relay /path/to/socket < request > reply
 tiny -t 500 /path/to/socket < request > reply    # give up if nothing moves for 500 ms
 ```
+
+In argument mode `tiny` sends the script call — `argv[0]` (the client), the script path, then its
+parameters — one per line, then half-closes the socket; the reply is copied to stdout and `tiny` exits.
+tiny's own options (`--socket`, `-t`) are consumed, not sent. The script path is always the first line
+after the client, so a daemon can run the script by name instead of guessing from the parameters. A
+shebang works:
+
+```sh
+#!/path/to/tiny --socket=/path/to/socket
+```
+
+The endpoint comes from `--socket` or `TINY_SOCKET` and is not a payload line. An argument containing a
+newline cannot be represented in one-line framing and is refused; use `--relay` for byte payloads.
+Argument mode does not read stdin and has no exit-status channel beyond `tiny`'s own 0/1/2 (and 124 for
+`-t`).
 
 **The timeout is opt-in.** Without `-t` the relay waits as long as the peer does, which is the right
 default when the peer is a daemon that answers when it answers. With `-t <milliseconds>` it is an
 *idle* timeout — neither direction moving for that long ends the run — and the exit code is **124**,
-the one `timeout(1)` uses, so a script that already checks for that keeps working:
+the one `timeout(1)` uses, so a script that already checks for that keeps working. In argument mode
+`-t` is the wait for the reply; the same 124 applies. For example:
 
 ```
 $ tiny -t 500 /path/to/silent-socket < request
@@ -107,14 +130,14 @@ Two conclusions, and the second is the one that matters:
 
 ### Where `tiny` is not the right tool
 
-`tiny` is now the default on POSIX: it relays in both directions, costs one process, and runs from any
-shell. Two things still belong to `socutil-cli`:
+`tiny` is now the default on POSIX: it relays in both directions or sends a script call, costs one
+process, and runs from any shell. Two things still belong to `socutil-cli`:
 
 - **Windows.** There is no portable `poll`: `std.posix.poll` is a compile error on Windows (`use
   std.Io instead`), and the Win32 equivalent is waitable handles, a separate implementation. So `tiny`
   is built for `x86_64-linux-musl`, and on Windows the two-thread `socutil-cli` remains the client.
   This is a platform limit, not something more engineering on `tiny` fixes.
-- **Diagnostics.** `socutil-cli` has `-v` and `-h`; `tiny` prints one usage line and nothing else.
+- **Diagnostics.** `socutil-cli` has `-v` and `-h`; `tiny` prints a short usage line and nothing else.
   When a connection misbehaves and you want to see where, the verbose client is the one to reach for.
 
 Nothing else was left: the buffering, the 64 KiB ceiling and the "cannot answer while writing" limit
