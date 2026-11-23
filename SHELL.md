@@ -49,16 +49,18 @@ the socket's output goes to stdout, and it exits when either side closes.
 `socutil-cli` is a full duplex relay: it builds an `Io.Threaded` event loop and starts two pump
 threads. That machinery is what a transfer *can* need, and it is also what a client pays for on every
 call. `shell/cli_tiny.zig` is the same relay — both directions at once — with no `std.Io`, no threads
-and no allocator, using one `poll` loop. `tiny` also has an argument mode for a script call:
+and no allocator, using one `poll` loop. `tiny` also has a command mode: one JSON preamble line, then
+stdin/stdout.
 
 ```sh
 cd shell
 zig build-exe -target x86_64-linux-musl -O ReleaseSmall -fstrip -fsingle-threaded \
-    --name tiny cli_tiny.zig          # -> ./tiny, ~155 KB, statically linked
+    --name tiny cli_tiny.zig          # -> ./tiny, ~160 KB, statically linked
 
-# argument mode: argv[0], the script, then its parameters, one per line
+# command mode: one JSON line with command, args, cwd and env; then raw stdin/stdout
 tiny --socket /path/to/socket /path/to/script.sh a b
 TINY_SOCKET=/path/to/socket tiny /path/to/script.sh a b
+tiny --no-env --socket /path/to/socket /path/to/script.sh a b   # env omitted
 
 # relay: stdin to the socket, the reply to stdout
 tiny /path/to/socket < request > reply
@@ -66,26 +68,30 @@ tiny --relay /path/to/socket < request > reply
 tiny -t 500 /path/to/socket < request > reply    # give up if nothing moves for 500 ms
 ```
 
-In argument mode `tiny` sends the script call — `argv[0]` (the client), the script path, then its
-parameters — one per line, then half-closes the socket; the reply is copied to stdout and `tiny` exits.
-tiny's own options (`--socket`, `-t`) are consumed, not sent. The script path is always the first line
-after the client, so a daemon can run the script by name instead of guessing from the parameters. A
-shebang works:
+In command mode `tiny` writes one JSON line:
+
+```json
+{"v":1,"command":"/path/script.sh","args":["a","b"],"cwd":"/home/me","env":{"PATH":"/usr/bin"}}
+```
+
+`command` is the script or command that was called, `args` are its arguments, `cwd` is the caller's
+working directory and `env` is the process environment. `--no-env` omits the `env` key. `tiny`'s own
+options (`--socket`, `-t`, `--no-env`) are consumed, not sent. After the line, `tiny` relays stdin to
+the socket and the response to stdout. A shebang works:
 
 ```sh
 #!/path/to/tiny --socket=/path/to/socket
 ```
 
-The endpoint comes from `--socket` or `TINY_SOCKET` and is not a payload line. An argument containing a
-newline cannot be represented in one-line framing and is refused; use `--relay` for byte payloads.
-Argument mode does not read stdin and has no exit-status channel beyond `tiny`'s own 0/1/2 (and 124 for
-`-t`).
+The endpoint comes from `--socket` or `TINY_SOCKET` and is not part of the JSON. The full wire contract
+is [TINY-PROTOCOL.md](TINY-PROTOCOL.md); it has no exit-status channel beyond `tiny`'s own 0/1/2 (and
+124 for `-t`).
 
 **The timeout is opt-in.** Without `-t` the relay waits as long as the peer does, which is the right
 default when the peer is a daemon that answers when it answers. With `-t <milliseconds>` it is an
 *idle* timeout — neither direction moving for that long ends the run — and the exit code is **124**,
-the one `timeout(1)` uses, so a script that already checks for that keeps working. In argument mode
-`-t` is the wait for the reply; the same 124 applies. For example:
+the one `timeout(1)` uses, so a script that already checks for that keeps working. In command mode
+`-t` is the idle wait while relaying stdin and the reply; the same 124 applies. For example:
 
 ```
 $ tiny -t 500 /path/to/silent-socket < request
@@ -130,8 +136,8 @@ Two conclusions, and the second is the one that matters:
 
 ### Where `tiny` is not the right tool
 
-`tiny` is now the default on POSIX: it relays in both directions or sends a script call, costs one
-process, and runs from any shell. Two things still belong to `socutil-cli`:
+`tiny` is now the default on POSIX: it relays in both directions or sends a JSON command preamble,
+costs one process, and runs from any shell. Two things still belong to `socutil-cli`:
 
 - **Windows.** There is no portable `poll`: `std.posix.poll` is a compile error on Windows (`use
   std.Io instead`), and the Win32 equivalent is waitable handles, a separate implementation. So `tiny`
@@ -487,7 +493,7 @@ runs in `dash`, `fish`, `sh`, `ksh93`, a Makefile or a cron entry. `tiny` finish
 `/bin/true`, so the only way to go faster is to not start a process at all, which is what the builtin
 does and why it stays as the bash-only optimisation.
 
-The zero-install routes, when even a 155 KB binary is too much:
+The zero-install routes, when even a 160 KB binary is too much:
 
 | Shell        | Native?                        | Cheapest no-fork route                                | Fully fork-free?        |
 | ------------ | ------------------------------ | ----------------------------------------------------- | ----------------------- |

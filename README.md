@@ -7,10 +7,10 @@ to one, and relays it to the page like a terminal. It is a library plus two bina
   and no build step for the UI.
 - **`socutil-cli`** — a `socat` alternative: connects to a Unix socket and relays stdin/stdout. A
   forking path for shell scripts that need a socket relay without a browser.
-- **`shell/tiny`** — a 155 KB static client: relay stdin to a socket, or send a script call's argv one per
-  line and copy the reply. No threads and no allocator, so it costs about what starting any process
-  costs (0.58 ms here, against 0.13 ms for a bash builtin and 1.05 ms for `socutil-cli`).
-  Build it and use it in any shell; see [SHELL.md](SHELL.md).
+- **`shell/tiny`** — a 160 KB static client: relay stdin to a socket, or send one JSON command
+  preamble and relay stdin/stdout. No threads and no allocator, so it costs about what starting any
+  process costs (0.58 ms here, against 0.13 ms for a bash builtin and 1.05 ms for `socutil-cli`).
+  Build it and use it in any shell; see [SHELL.md](SHELL.md) and [TINY-PROTOCOL.md](TINY-PROTOCOL.md).
 
 See [SHELL.md](SHELL.md) for how to call Unix sockets from the shell, and how to skip the fork where
 the shell allows it.

@@ -47,7 +47,7 @@ jobs:
               cp zig-out/bin/socutil "dist/$pkg/socutil"
               cp zig-out/bin/socutil-cli "dist/$pkg/socutil-cli"
             fi
-            cp README.md SHELL.md "dist/$pkg/"
+            cp README.md SHELL.md TINY-PROTOCOL.md "dist/$pkg/"
 
             # `tiny` is the Linux-only, no-allocator shell client from SHELL.md.
             if [[ "$target" == *linux* ]]; then
